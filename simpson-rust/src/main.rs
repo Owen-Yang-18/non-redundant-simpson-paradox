@@ -2,7 +2,8 @@ use std::io::{BufRead, BufReader};
 use rayon::prelude::*;
 use std::env;
 use std::fs::File;
-// use std::io::Write;
+use std::io::Write;
+// use std::path::Path;
 // use std::path::PathBuf;
 use std::time::Instant;
 use std::collections::{HashMap, HashSet};
@@ -93,6 +94,23 @@ pub fn get_lines(file_name: &str, size: usize) -> Vec<Vec<String>> {
 }
 
 
+/// Extract header from CSV file
+pub fn extract_header(filename: &str) -> Vec<String> {
+    if let Ok(file) = File::open(filename) {
+        let mut reader = BufReader::new(file);
+        let mut first_line = String::new();
+        if reader.read_line(&mut first_line).is_ok() {
+            return first_line
+                .trim()
+                .split(',')
+                .map(|s| s.to_string())
+                .collect();
+        }
+    }
+    Vec::new()
+}
+
+
 pub fn create_index(
     records: &Vec<Vec<String>>,
     size: usize,
@@ -101,6 +119,7 @@ pub fn create_index(
     lengths: &mut Vec<i32>,
     enum_recs: &mut Vec<Vec<i32>>,
     binary_labels: &mut Vec<Vec<i32>>,
+    reverse_index: &mut HashMap<(usize, i32), String>,
 ) {
     let mut first_line = true;
     for record in records {
@@ -122,6 +141,8 @@ pub fn create_index(
                 if !index_holder.contains_key(&key) {
                     lengths[i] += 1;
                     index_holder.insert(key.clone(), lengths[i]);
+
+                    reverse_index.insert((i, lengths[i]), val.clone());
                 }
                 let mapped_value = *index_holder.get(&key).unwrap();
                 enum_rec.push(mapped_value);
@@ -533,6 +554,112 @@ pub fn get_indexes(key: i64, mover: &Vec<i32>, size: usize) -> Vec<i64> {
     }
     ret[size - 1] = key >> mover[size - 1];
     ret
+}
+
+
+/// Decode a population key to human-readable string
+pub fn decode_population(
+    pop_key: i64,
+    mover: &Vec<i32>,
+    size: usize,
+    reverse_index: &HashMap<(usize, i32), String>,
+    attr_names: &[String],
+) -> String {
+    let indices = get_indexes(pop_key, mover, size);
+    
+    let mut parts = Vec::new();
+    for (attr_idx, &value_id) in indices.iter().enumerate() {
+        let attr_name = if attr_idx < attr_names.len() {
+            &attr_names[attr_idx]
+        } else {
+            "?"
+        };
+        
+        if value_id == 0 {
+            // Wildcard
+            parts.push(format!("{}=*", attr_name));
+        } else {
+            // Lookup original string value
+            let value_str = reverse_index
+                .get(&(attr_idx, value_id as i32))
+                .map(|s| s.as_str())
+                .unwrap_or("?");
+            parts.push(format!("{}={}", attr_name, value_str));
+        }
+    }
+    
+    format!("({})", parts.join(", "))
+}
+
+
+/// Write infos to human-readable file
+pub fn write_infos_to_file(
+    infos: &HashMap<i64, HashSet<Quartet<i64, i64, usize, usize>>>,
+    filename: &str,
+    mover: &Vec<i32>,
+    size: usize,
+    reverse_index: &HashMap<(usize, i32), String>,
+    attr_names: &[String],
+    label_names: &[String],
+) -> std::io::Result<()> {
+    use std::io::Write;
+    
+    let mut file = File::create(filename)?;
+    
+    // Sort by size (descending) and take top 100k
+    let mut groups: Vec<_> = infos.iter().collect();
+    groups.sort_by(|a, b| {
+        // Sort by set size (descending), then by signature for consistency
+        b.1.len().cmp(&a.1.len())
+            .then_with(|| a.0.cmp(b.0))
+    });
+    
+    let max_groups = 100_000;
+    let groups_to_write = groups.len().min(max_groups);
+    let omitted = groups.len().saturating_sub(max_groups);
+    
+    writeln!(file, "Total redundant paradox groups: {}", infos.len())?;
+    writeln!(file, "Showing top {} groups (by size)", groups_to_write)?;
+    if omitted > 0 {
+        writeln!(file, "Omitted {} smaller groups", omitted)?;
+    }
+    writeln!(file, "{}", "=".repeat(80))?;
+    writeln!(file)?;
+    
+    for (group_idx, (signature, paradox_set)) in groups.iter().take(max_groups).enumerate() {
+        writeln!(file, "Group {} (Signature: {}, Count: {})", 
+                 group_idx + 1, signature, paradox_set.len())?;
+        writeln!(file, "{}", "-".repeat(80))?;
+        
+        let mut paradoxes: Vec<_> = paradox_set.iter().collect();
+        paradoxes.sort_by_key(|sp| (sp.value0, sp.value1, sp.value2, sp.value3));
+        
+        for (sp_idx, sp) in paradoxes.iter().enumerate() {
+            // Decode populations
+            let s1_str = decode_population(sp.value0, mover, size, reverse_index, attr_names);
+            let s2_str = decode_population(sp.value1, mover, size, reverse_index, attr_names);
+            
+            // Get separator name
+            let sep_name = if sp.value2 < attr_names.len() {
+                &attr_names[sp.value2]
+            } else {
+                "?"
+            };
+            
+            // Get label name
+            let label_name = if sp.value3 < label_names.len() {
+                &label_names[sp.value3]
+            } else {
+                "?"
+            };
+            
+            writeln!(file, "  Paradox {}: s1={}, s2={}, separator={}, label={}",
+                     sp_idx + 1, s1_str, s2_str, sep_name, label_name)?;
+        }
+        writeln!(file)?;
+    }
+    
+    Ok(())
 }
 
 
@@ -1017,11 +1144,25 @@ fn main() {
     let lines = get_lines(filename, size);  
     println!("Number of records: {}", lines.len());
 
+    let header = extract_header(filename);
+    let attr_names: Vec<String> = if header.len() >= size {
+        header[0..size].to_vec()
+    } else {
+        (0..size).map(|i| format!("attr_{}", i)).collect()
+    };
+    let label_names: Vec<String> = if header.len() > size {
+        header[size..].to_vec()
+    } else {
+        (0..num_labels).map(|i| format!("label_{}", i)).collect()
+    };
+
     // 2. Create index mappings
     let mut index_holder: HashMap<String, i32> = HashMap::new();
     let mut lengths = vec![0i32; size];             // track unique counts
     let mut enum_recs = Vec::with_capacity(lines.len());
     let mut b_labs = Vec::with_capacity(lines.len());
+
+    let mut reverse_index: HashMap<(usize, i32), String> = HashMap::new();
 
     create_index(
         &lines,
@@ -1031,6 +1172,7 @@ fn main() {
         &mut lengths,
         &mut enum_recs,
         &mut b_labs,
+        &mut reverse_index,
     );
 
     // 3. Compute bit shifts
@@ -1075,5 +1217,27 @@ fn main() {
     println!("Total runtime: {:.4} seconds", start_time.elapsed().as_secs_f64());
     println!("Total number of SP: {}", sps.len());
     println!("Total number of redundant relations: {}", infos.len());
-}
 
+    use std::path::Path;
+    
+    let output_filename = {
+        let input_path = Path::new(filename);
+        let stem = input_path.file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("output");
+        format!("{}_infos.txt", stem)
+    };
+    
+    match write_infos_to_file(
+        &infos,
+        &output_filename,
+        &mov,
+        size,
+        &reverse_index,
+        &attr_names,
+        &label_names,
+    ) {
+        Ok(_) => println!("Results written to {}", output_filename),
+        Err(e) => eprintln!("Failed to write output file: {}", e),
+    }
+}
