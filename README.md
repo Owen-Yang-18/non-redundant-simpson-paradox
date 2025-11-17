@@ -144,6 +144,8 @@ Each paradox entry shows:
 - **s1, s2**: Two sibling populations being compared
 - **separator**: The separator attribute for population partitioning
 - **label**: The label attribute for measuring frequency statistics
+- **Signature**: A hash identifying redundant paradoxes (same signature = same group)
+- **Count**: Number of redundant paradoxes in this group
 
 ## Examples
 
